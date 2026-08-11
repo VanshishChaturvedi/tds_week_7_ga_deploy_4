@@ -10,34 +10,23 @@ ALLOWED_CHANNELS = {"html", "markdown", "url", "sql", "shell"}
 
 # ==========================================
 # GLOBAL SAFETY NET
-# Catch all HTTP errors/crashes to guarantee endpoint availability
 # ==========================================
 @app.errorhandler(Exception)
 def handle_exception(e):
     return jsonify(safe=False, reason="INVALID_SCHEMA"), 200
 
 def custom_decode(text):
-    """
-    Decodes the payload in the exact order requested:
-    1. Percent-escapes
-    2. HTML entities
-    3. \uXXXX escapes
-    """
-    # 1. Percent
+    # 1. Percent-escapes
     decoded = urllib.parse.unquote(text)
-    # 2. HTML Entities
+    # 2. HTML entities
     decoded = html.unescape(decoded)
-    # 3. Unicode escapes
+    # 3. Unicode escapes (Fixed the SyntaxError by making the regex string raw 'r')
     decoded = re.sub(r'\\u([0-9a-fA-F]{4})', lambda m: chr(int(m.group(1), 16)), decoded)
     return decoded
 
 def get_violation(channel, text):
-    """
-    Applies the channel-specific rules in their exact precedence order.
-    Returns the reason string if a violation is found, otherwise None.
-    """
     if channel == 'html':
-        # SCRIPT_TAG: opening script, iframe, object or embed tag (case-insensitive)
+        # SCRIPT_TAG: opening script, iframe, object or embed tag
         if re.search(r'(?i)<\s*(script|iframe|object|embed)\b', text):
             return "SCRIPT_TAG"
         # EVENT_HANDLER: on...= attribute
@@ -55,14 +44,20 @@ def get_violation(channel, text):
             matches = re.findall(r'(?i)(?:src|href)\s*=\s*(["\'])(.*?)\1', text)
             urls = [m[1] for m in matches]
         elif channel == 'markdown':
-            urls = re.findall(r'\]\(([^)]+)\)', text)
+            # Captures everything inside ](...)
+            urls = re.findall(r'\]\(([^)]*)\)', text)
         elif channel == 'url':
             urls = [text.strip()]
 
         # URL Evaluation
         for u in urls:
-            check_u = u
-            # Handle protocol-relative references (browser treats them as absolute)
+            check_u = u.strip()
+            
+            # Skip empty urls to prevent parser crashing
+            if not check_u:
+                continue
+                
+            # Handle protocol-relative references (//host/path -> https://host/path)
             if check_u.startswith('//'):
                 check_u = 'https:' + check_u
             
@@ -73,7 +68,7 @@ def get_violation(channel, text):
                 return "DANGEROUS_SCHEME"
             
             # EXTERNAL_EXFIL (Absolute URL host check)
-            if parsed.netloc: # netloc is populated if it's an absolute URL
+            if parsed.netloc: 
                 if parsed.hostname not in ALLOWED_HOSTS:
                     return "EXTERNAL_EXFIL"
                     
@@ -91,17 +86,15 @@ def get_violation(channel, text):
 
 @app.route('/sanitize-output', methods=['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'], strict_slashes=False)
 def sanitize_output():
-    # Enforce method
     if request.method != 'POST':
         return jsonify(safe=False, reason="INVALID_SCHEMA")
 
-    # Safe JSON parse
     try:
         data = request.get_json(force=True, silent=True)
     except Exception:
         data = None
 
-    # RULE: INVALID_SCHEMA
+    # Strict Schema Validation
     if not isinstance(data, dict):
         return jsonify(safe=False, reason="INVALID_SCHEMA")
     
@@ -115,19 +108,18 @@ def sanitize_output():
     if len(output) > 20000:
         return jsonify(safe=False, reason="INVALID_SCHEMA")
 
-    # RULE: ENCODED_PAYLOAD
+    # ENCODED_PAYLOAD Rule
     decoded_output = custom_decode(output)
     if decoded_output != output:
-        # If the decoded string differs, check if it trips ANY rule
+        # If decoding reveals a payload that trips ANY rule, flag it as ENCODED_PAYLOAD
         if get_violation(channel, decoded_output) is not None:
             return jsonify(safe=False, reason="ENCODED_PAYLOAD")
 
-    # Apply channel rules to original output
+    # Apply standard channel rules to the original output
     violation = get_violation(channel, output)
     if violation:
         return jsonify(safe=False, reason=violation)
 
-    # All checks passed
     return jsonify(safe=True, reason="SAFE")
 
 if __name__ == '__main__':
