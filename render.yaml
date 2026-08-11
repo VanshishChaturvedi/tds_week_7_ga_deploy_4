@@ -3,4 +3,4 @@ services:
     name: llm-output-handling-gate
     env: python
     buildCommand: "pip install -r requirements.txt"
-    startCommand: "gunicorn app:app"
+    startCommand: "gunicorn app:app --workers 4 --threads 2 --timeout 60"
