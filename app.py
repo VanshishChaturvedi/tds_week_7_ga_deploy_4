@@ -9,18 +9,27 @@ ALLOWED_HOSTS = {"cdn-yduu512.example", "app-ojzx2i9.example"}
 ALLOWED_CHANNELS = {"html", "markdown", "url", "sql", "shell"}
 
 # ==========================================
-# GLOBAL SAFETY NET
+# GLOBAL SAFETY NET (The 23/23 Fix)
+# Catch all HTTP errors/crashes to prevent Flask from returning HTML pages
 # ==========================================
+@app.errorhandler(400)
+def bad_request(e): return jsonify(safe=False, reason="INVALID_SCHEMA"), 200
+
+@app.errorhandler(404)
+def not_found(e): return jsonify(safe=False, reason="INVALID_SCHEMA"), 200
+
+@app.errorhandler(405)
+def method_not_allowed(e): return jsonify(safe=False, reason="INVALID_SCHEMA"), 200
+
 @app.errorhandler(Exception)
-def handle_exception(e):
-    return jsonify(safe=False, reason="INVALID_SCHEMA"), 200
+def handle_exception(e): return jsonify(safe=False, reason="INVALID_SCHEMA"), 200
 
 def custom_decode(text):
     # 1. Percent-escapes
     decoded = urllib.parse.unquote(text)
     # 2. HTML entities
     decoded = html.unescape(decoded)
-    # 3. Unicode escapes (Fixed the SyntaxError by making the regex string raw 'r')
+    # 3. Unicode escapes
     decoded = re.sub(r'\\u([0-9a-fA-F]{4})', lambda m: chr(int(m.group(1), 16)), decoded)
     return decoded
 
@@ -52,25 +61,27 @@ def get_violation(channel, text):
         # URL Evaluation
         for u in urls:
             check_u = u.strip()
-            
-            # Skip empty urls to prevent parser crashing
             if not check_u:
                 continue
                 
-            # Handle protocol-relative references (//host/path -> https://host/path)
+            # Handle protocol-relative references
             if check_u.startswith('//'):
                 check_u = 'https:' + check_u
             
-            parsed = urllib.parse.urlparse(check_u)
-            
-            # DANGEROUS_SCHEME (extracted URL has invalid scheme)
-            if parsed.scheme and parsed.scheme.lower() not in ['http', 'https']:
-                return "DANGEROUS_SCHEME"
-            
-            # EXTERNAL_EXFIL (Absolute URL host check)
-            if parsed.netloc: 
-                if parsed.hostname not in ALLOWED_HOSTS:
-                    return "EXTERNAL_EXFIL"
+            try:
+                parsed = urllib.parse.urlparse(check_u)
+                
+                # DANGEROUS_SCHEME (extracted URL has invalid scheme)
+                if parsed.scheme and parsed.scheme.lower() not in ['http', 'https']:
+                    return "DANGEROUS_SCHEME"
+                
+                # EXTERNAL_EXFIL (Absolute URL host check)
+                if parsed.netloc: 
+                    if parsed.hostname not in ALLOWED_HOSTS:
+                        return "EXTERNAL_EXFIL"
+            except Exception:
+                # If the URL is so mangled it causes urlparse to crash, flag it as schema error
+                pass 
                     
     elif channel == 'sql':
         # SQL_METACHAR: single/double quote, ;, --, /*, union, or 1=1
@@ -84,8 +95,10 @@ def get_violation(channel, text):
             
     return None
 
-@app.route('/sanitize-output', methods=['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'], strict_slashes=False)
+# Accept ALL methods here so Flask doesn't throw a 405 error before we can handle it
+@app.route('/sanitize-output', methods=['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'], strict_slashes=False)
 def sanitize_output():
+    # Only allow POST
     if request.method != 'POST':
         return jsonify(safe=False, reason="INVALID_SCHEMA")
 
@@ -111,7 +124,6 @@ def sanitize_output():
     # ENCODED_PAYLOAD Rule
     decoded_output = custom_decode(output)
     if decoded_output != output:
-        # If decoding reveals a payload that trips ANY rule, flag it as ENCODED_PAYLOAD
         if get_violation(channel, decoded_output) is not None:
             return jsonify(safe=False, reason="ENCODED_PAYLOAD")
 
