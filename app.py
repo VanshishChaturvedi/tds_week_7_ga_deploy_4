@@ -1,5 +1,6 @@
 import re
 import urllib.parse
+import json
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
@@ -10,17 +11,10 @@ ALLOWED_CHANNELS = {"html", "markdown", "url", "sql", "shell"}
 # ==========================================
 # GLOBAL SAFETY NET
 # ==========================================
-@app.errorhandler(400)
-def bad_request(e): return jsonify(safe=False, reason="INVALID_SCHEMA"), 200
-
-@app.errorhandler(404)
-def not_found(e): return jsonify(safe=False, reason="INVALID_SCHEMA"), 200
-
-@app.errorhandler(405)
-def method_not_allowed(e): return jsonify(safe=False, reason="INVALID_SCHEMA"), 200
-
 @app.errorhandler(Exception)
-def handle_exception(e): return jsonify(safe=False, reason="INVALID_SCHEMA"), 200
+def handle_exception(e):
+    # Ensures absolutely no 404/405/500 HTML pages ever leak out
+    return jsonify(safe=False, reason="INVALID_SCHEMA"), 200
 
 def custom_decode(text):
     # 1. Percent-escapes
@@ -37,7 +31,7 @@ def custom_decode(text):
         except Exception:
             return m.group(0)
             
-    # Matches &#NN; or &#xNN; (with or without strict semicolon to be safe)
+    # Matches &#NN; or &#xNN;
     decoded = re.sub(r'&#([0-9]+|x[0-9a-fA-F]+);?', replace_num, decoded)
     
     named_entities = {
@@ -51,7 +45,13 @@ def custom_decode(text):
         decoded = decoded.replace(k, v)
         
     # 3. \uXXXX escapes
-    decoded = re.sub(r'\\u([0-9a-fA-F]{4})', lambda m: chr(int(m.group(1), 16)), decoded)
+    def replace_u(m):
+        try:
+            return chr(int(m.group(1), 16))
+        except Exception:
+            return m.group(0)
+            
+    decoded = re.sub(r'\\u([0-9a-fA-F]{4})', replace_u, decoded)
     
     return decoded
 
@@ -76,7 +76,8 @@ def get_violation(channel, text):
             matches = re.findall(r'(?i)(?:src|href)\s*=\s*(["\'])(.*?)\1', text)
             urls = [m[1] for m in matches]
         elif channel == 'markdown':
-            urls = re.findall(r'\]\(([^)]+)\)', text)
+            # Captures target inside ](...)
+            urls = re.findall(r'\]\((.*?)\)', text)
         elif channel == 'url':
             urls = [text.strip()]
 
@@ -86,14 +87,13 @@ def get_violation(channel, text):
             if not check_u:
                 continue
                 
-            # Protocol-relative references
+            # Protocol-relative references become absolute
             if check_u.startswith('//'):
                 check_u = 'https:' + check_u
             
             try:
                 parsed = urllib.parse.urlparse(check_u)
             except ValueError:
-                # Catch catastrophically malformed URLs that crash the parser
                 return "DANGEROUS_SCHEME"
                 
             # If the URL specifies a scheme, it is evaluated as absolute
@@ -117,15 +117,18 @@ def get_violation(channel, text):
             
     return None
 
+# Accept ALL HTTP methods to prevent Flask from automatically returning 405 HTML errors
 @app.route('/sanitize-output', methods=['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'], strict_slashes=False)
 def sanitize_output():
     if request.method != 'POST':
         return jsonify(safe=False, reason="INVALID_SCHEMA")
 
+    # OUT-OF-THE-BOX FIX: Bypass Flask's get_json() to avoid 400/415 HTTP errors on bad Content-Types
     try:
-        data = request.get_json(force=True, silent=True)
+        raw_data = request.get_data(as_text=True)
+        data = json.loads(raw_data)
     except Exception:
-        data = None
+        return jsonify(safe=False, reason="INVALID_SCHEMA")
 
     # Strict Schema Validation
     if not isinstance(data, dict):
