@@ -1,168 +1,173 @@
-import urllib.parse
-import re
 import json
+import re
+from typing import Optional
+from urllib.parse import unquote, urlsplit
+
 from fastapi import FastAPI, Request, Response
-from starlette.exceptions import HTTPException as StarletteHTTPException
-from fastapi.exceptions import RequestValidationError
+
 
 app = FastAPI()
 
-# YOUR exact assigned hosts
 ALLOWED_HOSTS = {"cdn-yduu512.example", "app-ojzx2i9.example"}
+CHANNELS = {"html", "markdown", "url", "sql", "shell"}
 
-# ==========================================
-# GLOBAL SAFETY NET
-# Prevents FastAPI from ever returning 404/405/422 default HTML/JSON pages
-# ==========================================
-@app.exception_handler(Exception)
-async def global_exception_handler(request: Request, exc: Exception):
-    return Response(content=json.dumps({"safe": False, "reason": "INVALID_SCHEMA"}), media_type="application/json", status_code=200)
+# These are deliberately syntax checks, not a list of suspicious phrases.
+SCRIPT_TAG_RE = re.compile(r"<\s*(?:script|iframe|object|embed)\b", re.IGNORECASE)
+EVENT_HANDLER_RE = re.compile(
+    r"(?<![A-Za-z0-9_:-])on[A-Za-z][A-Za-z0-9_:-]*\s*=", re.IGNORECASE
+)
+DANGEROUS_SCHEME_RE = re.compile(r"(?:javascript|data|vbscript)\s*:", re.IGNORECASE)
+HTML_URL_RE = re.compile(
+    r"(?<![A-Za-z0-9_:-])(?:src|href)(?![A-Za-z0-9_:-])\s*=\s*"
+    r"(?:\"([^\"]*)\"|'([^']*)')",
+    re.IGNORECASE,
+)
+SQL_METACHAR_RE = re.compile(r"['\";]|--|/\*|\bunion\b|\bor\s+1\s*=\s*1", re.IGNORECASE)
+SHELL_METACHAR_RE = re.compile(r"[;&|`<>]|\$\(|\$\{")
+UNICODE_ESCAPE_RE = re.compile(r"\\u([0-9A-Fa-f]{4})")
 
-@app.exception_handler(StarletteHTTPException)
-async def http_exception_handler(request: Request, exc: StarletteHTTPException):
-    return Response(content=json.dumps({"safe": False, "reason": "INVALID_SCHEMA"}), media_type="application/json", status_code=200)
 
-@app.exception_handler(RequestValidationError)
-async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    return Response(content=json.dumps({"safe": False, "reason": "INVALID_SCHEMA"}), media_type="application/json", status_code=200)
+def json_reply(safe: bool, reason: str) -> Response:
+    # A direct Response keeps every result to precisely the required JSON shape.
+    return Response(
+        content=json.dumps({"safe": safe, "reason": reason}, separators=(",", ":")),
+        media_type="application/json",
+        status_code=200,
+    )
 
-def decode_once(text: str) -> str:
-    """Strictly decodes the text EXACTLY once according to the exact rules."""
-    # 1. Percent escapes
-    t = urllib.parse.unquote(text)
-    
-    # 2. HTML Entities (Numeric and 5 specific named entities, handling optional semicolons)
-    def numeric_entity(m):
-        val = m.group(1)
-        try:
-            if val.lower().startswith('x'):
-                return chr(int(val[1:], 16))
-            else:
-                return chr(int(val))
-        except Exception:
-            return m.group(0)
-            
-    t = re.sub(r'(?i)&#(x[0-9a-fA-F]+|[0-9]+);?', numeric_entity, t)
-    
-    # Only the exactly specified named entities
-    t = re.sub(r'(?i)&lt;?', '<', t)
-    t = re.sub(r'(?i)&gt;?', '>', t)
-    t = re.sub(r'(?i)&quot;?', '"', t)
-    t = re.sub(r'(?i)&apos;?', "'", t)
-    t = re.sub(r'(?i)&amp;?', '&', t)
-    
-    # 3. Unicode \uXXXX escapes
-    def unicode_escape(m):
-        try:
-            return chr(int(m.group(1), 16))
-        except Exception:
-            return m.group(0)
-            
-    t = re.sub(r'(?i)\\u([0-9a-fA-F]{4})', unicode_escape, t)
-    
-    return t
 
-def get_violation(channel: str, text: str):
-    # 1. HTML Specifics
-    if channel == "html":
-        if re.search(r'(?i)<\s*(script|iframe|object|embed)\b', text):
-            return "SCRIPT_TAG"
-        if re.search(r'(?i)\bon[a-z]+\s*=', text):
-            return "EVENT_HANDLER"
+def decode_html_entities_once(value: str) -> str:
+    """Decode only the entities named in the exercise, in one scan."""
+    entity_re = re.compile(
+        r"&#(?:[0-9]+|[xX][0-9A-Fa-f]+);|&(lt|gt|quot|apos|amp);"
+    )
 
-    # 2. Scheme & Exfil (HTML, Markdown, URL)
-    if channel in ("html", "markdown", "url"):
-        # Text-level dangerous scheme
-        if re.search(r'(?i)(javascript|data|vbscript)\s*:', text):
-            return "DANGEROUS_SCHEME"
-            
-        urls = []
-        if channel == "html":
-            for m in re.finditer(r'(?i)(?:src|href)\s*=\s*(["\'])(.*?)\1', text):
-                urls.append(m.group(2))
-        elif channel == "markdown":
-            for m in re.finditer(r'\]\(([^)]+)\)', text):
-                inner = m.group(1).strip()
-                # Split handles markdown titles properly e.g., ](http://url "Title")
-                url = inner.split()[0] if inner else ""
-                urls.append(url)
-        elif channel == "url":
-            urls.append(text.strip())
-
-        for u in urls:
-            u = u.strip()
-            if not u:
-                continue
-                
-            # Handle protocol-relative URL
-            if u.startswith("//"):
-                u = "https:" + u
-                
+    def replace(match: re.Match) -> str:
+        token = match.group(0)
+        if token.startswith("&#"):
+            number = token[2:-1]
+            base = 16 if number[:1].lower() == "x" else 10
+            digits = number[1:] if base == 16 else number
             try:
-                parsed = urllib.parse.urlparse(u)
-            except ValueError:
-                return "DANGEROUS_SCHEME"
-                
-            if parsed.scheme:
-                if parsed.scheme.lower() not in ('http', 'https'):
-                    return "DANGEROUS_SCHEME"
-                # Exfil check (if netloc exists, it's absolute)
-                if parsed.netloc: 
-                    if parsed.hostname not in ALLOWED_HOSTS:
-                        return "EXTERNAL_EXFIL"
+                return chr(int(digits, base))
+            except (ValueError, OverflowError):
+                return token
+        return {"lt": "<", "gt": ">", "quot": '\"', "apos": "'", "amp": "&"}[match.group(1)]
 
-    # 3. SQL Specific (Exact matching, no extra keywords)
-    if channel == "sql":
-        if re.search(r'(?i)([\'";]|--|/\*|\bunion\b|\bor\s+1\s*=\s*1)', text):
-            return "SQL_METACHAR"
-            
-    # 4. Shell Specific (Exact matching)
-    if channel == "shell":
-        if re.search(r'[;&|`<>]|\$\(|\$\{', text):
-            return "SHELL_METACHAR"
+    return entity_re.sub(replace, value)
 
+
+def decode_once(value: str) -> str:
+    """Apply the required stages once and in the required order."""
+    value = unquote(value)
+    value = decode_html_entities_once(value)
+    return UNICODE_ESCAPE_RE.sub(lambda match: chr(int(match.group(1), 16)), value)
+
+
+def markdown_targets(value: str):
+    """Yield destinations in Markdown ](...), preserving balanced parentheses."""
+    position = 0
+    while True:
+        start = value.find("](", position)
+        if start < 0:
+            return
+        index = start + 2
+        depth = 1
+        while index < len(value) and depth:
+            if value[index] == "(":
+                depth += 1
+            elif value[index] == ")":
+                depth -= 1
+            index += 1
+        if depth == 0:
+            target = value[start + 2 : index - 1].strip()
+            # Markdown also permits <destination>; the brackets are not URL data.
+            if target.startswith("<") and target.endswith(">"):
+                target = target[1:-1].strip()
+            yield target
+            position = index
+        else:
+            return
+
+
+def extracted_urls(channel: str, value: str):
+    if channel == "html":
+        for match in HTML_URL_RE.finditer(value):
+            yield match.group(1) if match.group(1) is not None else match.group(2)
+    elif channel == "markdown":
+        yield from markdown_targets(value)
+    elif channel == "url":
+        yield value.strip()
+
+
+def url_violation(value: str) -> Optional[str]:
+    """Return a URL rule failure. Only hostname equality authorizes a fetch."""
+    value = value.strip()
+    if not value:
+        return None
+
+    # A protocol-relative reference is an absolute browser fetch.
+    candidate = "https:" + value if value.startswith("//") else value
+    try:
+        parsed = urlsplit(candidate)
+    except ValueError:
+        # A malformed absolute-looking value cannot identify an approved host.
+        return "EXTERNAL_EXFIL" if re.match(r"[A-Za-z][A-Za-z0-9+.-]*:|//", value) else None
+
+    if parsed.scheme and parsed.scheme.lower() not in {"http", "https"}:
+        return "DANGEROUS_SCHEME"
+
+    if parsed.netloc:
+        try:
+            hostname = parsed.hostname
+        except ValueError:
+            return "EXTERNAL_EXFIL"
+        if hostname not in ALLOWED_HOSTS:
+            return "EXTERNAL_EXFIL"
     return None
 
-# The magic fix: A catch-all route ensures even trailing slashes or probing paths hit the JSON logic
-@app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"])
-async def catch_all(request: Request, path: str):
-    def exact_json_response(safe: bool, reason: str):
-        return Response(content=json.dumps({"safe": safe, "reason": reason}), media_type="application/json", status_code=200)
 
-    # Reject non-POST or wrong paths natively as INVALID_SCHEMA
-    if path != "sanitize-output" or request.method != "POST":
-        return exact_json_response(False, "INVALID_SCHEMA")
+def violation(channel: str, value: str) -> Optional[str]:
+    """Run a valid channel's checks in the problem's specified order."""
+    if channel == "html":
+        if SCRIPT_TAG_RE.search(value):
+            return "SCRIPT_TAG"
+        if EVENT_HANDLER_RE.search(value):
+            return "EVENT_HANDLER"
 
-    # Raw byte parsing bypasses framework HTTP 400 crashes on bad headers
+    if channel in {"html", "markdown", "url"}:
+        if DANGEROUS_SCHEME_RE.search(value):
+            return "DANGEROUS_SCHEME"
+        for item in extracted_urls(channel, value):
+            result = url_violation(item)
+            if result:
+                return result
+
+    if channel == "sql" and SQL_METACHAR_RE.search(value):
+        return "SQL_METACHAR"
+    if channel == "shell" and SHELL_METACHAR_RE.search(value):
+        return "SHELL_METACHAR"
+    return None
+
+
+@app.post("/sanitize-output")
+async def sanitize_output(request: Request) -> Response:
     try:
-        body_bytes = await request.body()
-        if not body_bytes:
-            return exact_json_response(False, "INVALID_SCHEMA")
-        data = json.loads(body_bytes.decode('utf-8'))
-    except Exception:
-        return exact_json_response(False, "INVALID_SCHEMA")
+        raw_body = await request.body()
+        data = json.loads(raw_body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return json_reply(False, "INVALID_SCHEMA")
 
     if not isinstance(data, dict):
-        return exact_json_response(False, "INVALID_SCHEMA")
-        
+        return json_reply(False, "INVALID_SCHEMA")
     channel = data.get("channel")
     output = data.get("output")
-    
-    if channel not in ("html", "markdown", "url", "sql", "shell"):
-        return exact_json_response(False, "INVALID_SCHEMA")
-        
-    if not isinstance(output, str) or len(output) > 20000:
-        return exact_json_response(False, "INVALID_SCHEMA")
+    if channel not in CHANNELS or not isinstance(output, str) or len(output) > 20_000:
+        return json_reply(False, "INVALID_SCHEMA")
 
-    # RULE: ENCODED_PAYLOAD
     decoded = decode_once(output)
-    if decoded != output:
-        if get_violation(channel, decoded) is not None:
-            return exact_json_response(False, "ENCODED_PAYLOAD")
+    if decoded != output and violation(channel, decoded) is not None:
+        return json_reply(False, "ENCODED_PAYLOAD")
 
-    # RULE: Check original text
-    v_orig = get_violation(channel, output)
-    if v_orig is not None:
-        return exact_json_response(False, v_orig)
-
-    return exact_json_response(True, "SAFE")
+    reason = violation(channel, output)
+    return json_reply(reason is None, reason or "SAFE")
